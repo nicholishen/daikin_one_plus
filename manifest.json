@@ -1,0 +1,10 @@
+{
+    "domain": "daikin_one_plus",
+    "name": "Daikin One Plus Thermostat",
+    "documentation": "https://github.com/nicholishen/daikin_oneplus",
+    "requirements": ["aiohttp==3.7.4.post0", "async_timeout==3.0.1"],
+    "dependencies": [],
+    "codeowners": ["@nicholishen"],
+    "config_flow": true,
+    "iot_class": "cloud_polling"
+}
