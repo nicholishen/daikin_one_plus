@@ -5,14 +5,38 @@ import json
 import logging
 import datetime
 
+from aiohttp.client_exceptions import ClientError
+
 from .const import (
-    CONF_API_KEY,
-    CONF_EMAIL,
-    CONF_INTEGRATOR_TOKEN,
-    CONF_LOCATION_NAME
+    API_BASE_URL,
+    API_TOKEN_URL,
+    API_DEVICES_URL,
+    API_DEVICE_UPDATE_MODE_SETPOINT_URL,
+    API_DEVICE_UPDATE_SCHEDULE_URL,
+    API_DEVICE_UPDATE_FAN_SETTINGS_URL,
+    API_DEVICE_INFO_URL,
 )
 
-_BASE_URL = "https://integrator-api.daikinskyport.com"
+_LOGGER = logging.getLogger(__name__)
+
+
+class InvalidTokenResponse(Exception):
+    def __init__(self, detail):
+        self.message = f"The token endpoint response is not valid: {detail}"
+        super().__init__()
+
+
+class InvalidCredentials(Exception):
+    """Raised when the provided credentials are incorrect."""
+
+    pass
+
+
+class ServerNotReachable(Exception):
+    """Raised when unable to reach the server."""
+
+    pass
+
 
 class DaikinOnePlusClient:
     def __init__(self, session, email, api_key, integrator_token, location_name=None):
@@ -21,60 +45,99 @@ class DaikinOnePlusClient:
         self.api_key = api_key
         self.integrator_token = integrator_token
         self.location_name = location_name.lower() if location_name else None
-        self.headers = {
-            "Content-Type": "application/json",
-            "x-api-key": self.api_key
-        }
-        asyncio.create_task(self.get_token())
+        self.headers = {"Content-Type": "application/json", "x-api-key": self.api_key}
+        self.access_token = None
+        self.token_expiration = None
 
-    async def get_token(self):
-        data = {"email": self.email, "integratorToken": self.integrator_token}
-        async with self.session.post(f"{_BASE_URL}/v1/token", headers=self.headers, json=data) as resp:
-            result = await resp.json()
-            
-            # Check that 'accessToken' and 'accessTokenExpiresIn' are in the response
-            if not 'accessToken' in result or not 'accessTokenExpiresIn' in result:
-                raise Exception("Missing accessToken or accessTokenExpiresIn in the response.")
-                
-            self.access_token = result['accessToken']
-            self.headers['Authorization'] = f"Bearer {self.access_token}"
-            self.token_expiration = datetime.datetime.now() + datetime.timedelta(seconds=result['accessTokenExpiresIn'])
-
-    async def _request(self, method, endpoint, data=None):
-        url = _BASE_URL + endpoint
-
-        if datetime.datetime.now() >= self.token_expiration:
+    async def _ensure_token_exists(self):
+        if (
+            self.access_token is None
+            or self.token_expiration is None
+            or datetime.datetime.now() >= self.token_expiration
+        ):
             await self.get_token()
 
+    async def _request(self, method, endpoint, data=None):
+        await self._ensure_token_exists()
+        url = API_BASE_URL + endpoint
         async with async_timeout.timeout(10):
-            async with self.session.request(method, url, headers=self.headers, json=data) as response:
+            async with self.session.request(
+                method, url, headers=self.headers, json=data
+            ) as response:
                 response.raise_for_status()
-                if response.content_length is not None and response.content_length > 0:
-                    return await response.json()
-                else:
-                    return {}
+                return await response.json() if response.content_length > 0 else {}
+
+    async def get_token(self):
+        try:
+            response = await self._request(
+                "POST",
+                API_TOKEN_URL,
+                data={"email": self.email, "integratorToken": self.integrator_token},
+            )
+        except ClientError as err:
+            raise ServerNotReachable(f"Unable to reach the token endpoint: {err}")
+        except Exception as ex:
+            raise ex
+
+        if "accessToken" not in response or "accessTokenExpiresIn" not in response:
+            raise InvalidCredentials("Invalid email or integrator token provided.")
+
+        self.access_token = response["accessToken"]
+        self.headers["Authorization"] = f"Bearer {self.access_token}"
+        self.token_expiration = datetime.datetime.now() + datetime.timedelta(
+            seconds=response["accessTokenExpiresIn"]
+        )
 
     async def get_devices(self):
-        devices = await self._request("GET", "/v1/devices")
-        locations_map = {location['locationName'].lower(): location for location in devices}
-        if self.location_name:
-            if self.location_name in locations_map:
-                return locations_map[self.location_name]['devices']
-            else:
-                raise ValueError(f"No location found with the name: {self.location_name}")
-        else:
-            return devices[0]['devices']
+        locations_devices = await self._request("GET", API_DEVICES_URL)
+        if locations_devices:
+            if not self.location_name:
+                return locations_devices[0]["devices"]
+            for location_devices in locations_devices:
+                if (
+                    self.location_name.casefold()
+                    == location_devices["locationName"].casefold()
+                ):
+                    return location_devices["devices"]
+        return []
 
     async def get_device_info(self, device_id):
-        return await self._request("GET", f"/v1/devices/{device_id}")
+        return await self._request("GET", API_DEVICE_INFO_URL.format(device_id))
 
-    async def update_device_mode_setpoint(self, device_id, mode, heat_setpoint, cool_setpoint):
-        data = {'mode': mode, 'heatSetpoint': heat_setpoint, 'coolSetpoint': cool_setpoint}
-        return await self._request("PUT", f"/v1/devices/{device_id}/msp", json=data)
+    async def update_device_mode_setpoint(
+        self, device_id, mode, heat_setpoint, cool_setpoint
+    ):
+        return await self._request(
+            "PUT",
+            API_DEVICE_UPDATE_MODE_SETPOINT_URL.format(device_id),
+            data={
+                "mode": mode,
+                "heatSetpoint": heat_setpoint,
+                "coolSetpoint": cool_setpoint,
+            },
+        )
 
     async def update_device_schedule(self, device_id, schedule_enabled):
-        return await self._request("PUT", f"/v1/devices/{device_id}/schedule", json={"scheduleEnabled": schedule_enabled})
+        return await self._request(
+            "PUT",
+            API_DEVICE_UPDATE_SCHEDULE_URL.format(device_id),
+            data={"scheduleEnabled": schedule_enabled},
+        )
 
-    async def update_device_fan_settings(self, device_id, fan_circulate, fan_circulate_speed):
-        data = {'fanCirculate': fan_circulate, 'fanCirculateSpeed': fan_circulate_speed}
-        return await self._request("PUT", f"/v1/devices/{device_id}/fan", json=data)
+    async def update_device_fan_settings(
+        self, device_id, fan_circulate, fan_circulate_speed
+    ):
+        return await self._request(
+            "PUT",
+            API_DEVICE_UPDATE_FAN_SETTINGS_URL.format(device_id),
+            data={
+                "fanCirculate": fan_circulate,
+                "fanCirculateSpeed": fan_circulate_speed,
+            },
+        )
+
+    async def get_devices_info(self):
+        devices = await self.get_devices()
+        return {
+            device["id"]: await self.get_device_info(device["id"]) for device in devices
+        }
